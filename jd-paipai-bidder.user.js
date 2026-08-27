@@ -1,0 +1,362 @@
+// ==UserScript==
+// @name         京东拍拍夺宝岛抢拍助手（心理价最后一刻出价）
+// @namespace    https://1paipai.jd.com/
+// @version      1.1.3
+// @description  适配新版 1paipai.jd.com 拍卖详情页：设置心理最高价与加价幅度，倒计时最后 N 秒按「当前价+加价幅度」出价（保守竞争模式，不直接出心理价）。仅剩最后几秒出一次价，不刷接口。
+// @author       WorkBuddy
+// @match        https://1paipai.jd.com/auction-detail/*
+// @grant        none
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /********************************************************************
+   * 免责声明
+   * 1. 本脚本仅供个人学习研究自动化技术使用，与京东官方无关。
+   * 2. 使用自动化出价可能违反京东服务条款，存在账号风控/处罚风险，请自行评估。
+   * 3. 不保证抢拍成功；出价可能触发验证码，需人工处理。
+   ********************************************************************/
+
+  // ---------- 配置 ----------
+  const LS_KEY = 'paipai_bidder_config';
+  const DEFAULT_AHEAD_SECONDS = 1;   // 倒计时剩余多少秒时出价
+  const DEFAULT_BID_STEP = 1;        // 默认加价幅度（元）
+  const POLL_MS = 500;               // 轮询间隔
+  const MIN_BID_GAP_MS = 1000;       // 出价后冷却（防重复提交）
+
+  // ---------- 状态 ----------
+  let cfg = { maxPrice: '', bidStep: DEFAULT_BID_STEP, aheadSeconds: DEFAULT_AHEAD_SECONDS, running: false };
+  let bidLocked = false;             // 本次监控周期内是否已出价
+  let lastBidAt = 0;
+  let timer = null;
+  let confirmObs = null;
+
+  try { const s = localStorage.getItem(LS_KEY); if (s) cfg = Object.assign(cfg, JSON.parse(s)); } catch (e) {}
+
+  function saveCfg() { try { localStorage.setItem(LS_KEY, JSON.stringify(cfg)); } catch (e) {} }
+
+  // ---------- 工具函数 ----------
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function text(el) { return el ? (el.innerText || '').trim() : ''; }
+
+  // 读取当前状态：beginning=未开拍, ing=竞拍中, ended=已结束, unknown
+  function getAuctionState() {
+    const banner = $('.auctionBanner');
+    const cls = banner ? banner.className : '';
+    if (/beginning/.test(cls)) return 'beginning';
+    if (/ing/.test(cls)) return 'ing';
+    if (/closed|ended/.test(cls)) return 'ended';
+    const t = text($('#count-down .text'));
+    if (t.includes('开始')) return 'beginning';
+    if (t.includes('结束')) return 'ing';
+    if (/结束|已结束|流拍/.test((banner ? banner.innerText : '') + ' ' + (document.body.innerText || '').slice(0, 200))) return 'ended';
+    return 'unknown';
+  }
+
+  // 解析倒计时为总秒数（#J-count-down 内为纯数字 <i> 序列，冒号为 <span>）
+  // 兼容 1~4 个数字：秒 / 分:秒 / 时:分:秒 / 天:时:分:秒
+  // 从后往前定位：末位=秒、倒数第2=分、倒数第3=时、倒数第4=天
+  function getRemainSeconds() {
+    const cd = $('#J-count-down');
+    if (!cd) return -1;
+    const nums = [...cd.querySelectorAll('i')].map(i => parseInt(i.innerText.trim(), 10)).filter(n => !isNaN(n));
+    if (!nums.length) return -1;
+    const [s = 0, m = 0, h = 0, d = 0] = nums.reverse();
+    const sec = d * 86400 + h * 3600 + m * 60 + s;
+    return isNaN(sec) ? -1 : sec;
+  }
+
+  // 把秒数格式化成易读文本（1天2时3分 / 3分12秒 / 45s）
+  function formatDuration(sec) {
+    if (sec < 0) return '--';
+    if (sec < 60) return sec + 's';
+    const m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return m + '分' + (s ? s + '秒' : '');
+    const h = Math.floor(m / 60), mm = m % 60;
+    if (h < 24) return h + '时' + (mm ? mm + '分' : '');
+    const d = Math.floor(h / 24), hh = h % 24;
+    return d + '天' + (hh ? hh + '时' : '');
+  }
+
+  function getCurrentPrice() {
+    const p = $('.summary-price .p-price .price') || $('.J-summary-price .price');
+    return p ? parseFloat(p.innerText) : NaN;
+  }
+
+  function getBidCount() { return parseInt(text($('.recordCount')).replace(/[^\d]/g, ''), 10) || 0; }
+  function getCapPrice() {
+    const p = $('.n-price .price');
+    return p ? parseFloat(p.innerText) : NaN;
+  }
+
+  function getBidInput() { return $('li.auction-choose-amount input.el-input__inner'); }
+  function getBidButton() { return $('#choose-btns a, #choose-btns button'); }
+
+  // 判断出价按钮当前是否可点
+  function bidButtonDisabled(btn) {
+    if (!btn) return true;
+    if (btn.disabled) return true;
+    const cls = (btn.className || '');
+    if (/disabled/.test(cls)) return true;
+    const t = text(btn);
+    return /即将开始|已结束|已拍出|敬请期待/.test(t);
+  }
+
+  // Vue/Element 兼容地给 input 赋值并触发 input 事件
+  function setInputValue(input, val) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, String(val));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // 自动点掉确认弹窗（Element UI message-box）
+  function armConfirmClicker() {
+    if (confirmObs) return;
+    confirmObs = new MutationObserver(function () {
+      const okBtn = $('.el-message-box .el-button--primary, .el-message-box__btns .el-button--primary');
+      if (okBtn && okBtn.offsetParent !== null) {
+        try { okBtn.click(); log('已自动点击确认弹窗'); } catch (e) {}
+      }
+      const closeBtn = $('.el-dialog__headerbtn');
+      if (closeBtn && closeBtn.offsetParent !== null) {
+        try { closeBtn.click(); log('已自动关闭弹窗'); } catch (e) {}
+      }
+    });
+    confirmObs.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ---------- UI ----------
+  const panel = document.createElement('div');
+  panel.id = 'paipai-bidder-panel';
+  panel.style.cssText = [
+    'position:fixed;top:12px;right:12px;z-index:99999;width:250px;',
+    'background:#fff;border:1px solid #d9d9d9;border-radius:10px;',
+    'box-shadow:0 2px 12px rgba(0,0,0,.18);padding:12px 14px;',
+    'font:13px/1.6 "Microsoft YaHei",Arial,sans-serif;color:#333;',
+    'user-select:none'
+  ].join('');
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <b style="font-size:14px;color:#e1251b;">🛎 夺宝岛抢拍助手</b>
+      <span id="pb-state" style="font-size:12px;padding:1px 8px;border-radius:10px;background:#f0f0f0;color:#999;">未启动</span>
+    </div>
+    <div style="margin-bottom:6px;">心理最高价（超出即放弃，元）：
+      <input id="pb-max" type="number" step="1" min="0" style="width:86px;padding:2px 6px;border:1px solid #d9d9d9;border-radius:4px;"
+        placeholder="${cfg.maxPrice || '如 39'}">
+    </div>
+    <div style="margin-bottom:6px;">加价幅度（元，≥1 整数）：
+      <input id="pb-step" type="number" step="1" min="1" style="width:60px;padding:2px 6px;border:1px solid #d9d9d9;border-radius:4px;"
+        value="${cfg.bidStep}">
+    </div>
+    <div style="margin-bottom:8px;">倒计时剩
+      <input id="pb-ahead" type="number" step="0.1" min="0.1" max="10" style="width:52px;padding:2px 6px;border:1px solid #d9d9d9;border-radius:4px;"
+        value="${cfg.aheadSeconds}"> 秒时出价
+    </div>
+    <div style="margin-bottom:8px;color:#666;">
+      当前价：<b id="pb-price" style="color:#e1251b;">--</b>&nbsp;
+      出价 <b id="pb-bids">--</b> 次<br>
+      封顶价：<b id="pb-cap" style="color:#333;">--</b>&nbsp;
+      状态：<b id="pb-status">--</b>
+    </div>
+    <div id="pb-log" style="min-height:34px;max-height:72px;overflow:auto;background:#fafafa;border-radius:6px;padding:4px 8px;margin-bottom:8px;color:#555;font-size:12px;"></div>
+    <div style="display:flex;gap:8px;">
+      <button id="pb-start" style="flex:1;padding:6px 0;border:0;border-radius:6px;background:#e1251b;color:#fff;cursor:pointer;">▶ 开始抢拍</button>
+      <button id="pb-stop" style="flex:1;padding:6px 0;border:1px solid #d9d9d9;border-radius:6px;background:#fff;color:#666;cursor:pointer;">■ 停止</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const elState = panel.querySelector('#pb-state');
+  const elPrice = panel.querySelector('#pb-price');
+  const elBids = panel.querySelector('#pb-bids');
+  const elCap = panel.querySelector('#pb-cap');
+  const elStatus = panel.querySelector('#pb-status');
+  const elLog = panel.querySelector('#pb-log');
+  const elMax = panel.querySelector('#pb-max');
+  const elStep = panel.querySelector('#pb-step');
+  const elAhead = panel.querySelector('#pb-ahead');
+  const elStart = panel.querySelector('#pb-start');
+  const elStop = panel.querySelector('#pb-stop');
+
+  function log(msg) {
+    const line = document.createElement('div');
+    line.textContent = '[' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '] ' + msg;
+    elLog.prepend(line);
+    while (elLog.children.length > 8) elLog.removeChild(elLog.lastChild);
+  }
+
+  function setState(txt, bg, color) {
+    elState.textContent = txt;
+    elState.style.background = bg || '#f0f0f0';
+    elState.style.color = color || '#999';
+  }
+
+  // ---------- 核心逻辑 ----------
+  // 重试查找出价输入框/按钮（Vue 偶发重建 DOM，需容忍）
+  function findBidElements(maxTry, gap) {
+    return new Promise(function (resolve) {
+      let tried = 0;
+      (function attempt() {
+        const input = getBidInput();
+        const btn = getBidButton();
+        if ((input && btn && !bidButtonDisabled(btn)) || tried >= maxTry) {
+          resolve({ input: input || null, btn: btn || null });
+          return;
+        }
+        tried++;
+        setTimeout(attempt, gap);
+      })();
+    });
+  }
+
+  function tick() {
+    // 刷新信息面板
+    const price = getCurrentPrice();
+    if (!isNaN(price)) elPrice.textContent = price.toFixed(2);
+    elBids.textContent = getBidCount();
+    const cap = getCapPrice();
+    elCap.textContent = isNaN(cap) ? '--' : cap.toFixed(2);
+
+    const state = getAuctionState();
+    const remain = getRemainSeconds();
+    const remainTxt = formatDuration(remain);
+    const statusMap = {
+      beginning: '距开始 ' + remainTxt,
+      ing: '距结束 ' + remainTxt,
+      ended: '已结束',
+      unknown: '未知'
+    };
+    elStatus.textContent = statusMap[state] || state;
+
+    if (!cfg.running) return;
+
+    if (state === 'beginning') {
+      setState('等待开拍', '#fff7e6', '#d48806');
+      return;
+    }
+    if (state === 'ended') {
+      setState('已结束', '#f0f0f0', '#999');
+      cfg.running = false;
+      log('拍卖已结束，停止监控');
+      return;
+    }
+    if (state !== 'ing') { setState('未开拍', '#f0f0f0', '#999'); return; }
+
+    // 竞拍中
+    if (bidLocked) { setState('已出价，等待结果', '#e6f7ff', '#1890ff'); return; }
+    if (remain < 0) return;
+
+    setState('监控中', '#e6f7ff', '#1890ff');
+
+    const ahead = parseFloat(elAhead.value);
+    const aheadSec = isNaN(ahead) || ahead <= 0 ? DEFAULT_AHEAD_SECONDS : ahead;
+
+    // 剩余时间 ≤ 提前秒数时出价（保守模式：只加最低幅度，不直接出心理价）
+    if (remain <= aheadSec) {
+      const maxPrice = parseFloat(elMax.value);
+      if (isNaN(maxPrice) || maxPrice <= 0) {
+        setState('未设置心理价', '#fff1f0', '#cf1322');
+        log('请先填写心理最高价（超出此价即放弃）');
+        cfg.running = false;
+        return;
+      }
+      // 加价幅度：至少 1 元、必须整数
+      const stepRaw = parseFloat(elStep.value);
+      let stepVal;
+      if (isNaN(stepRaw) || stepRaw <= 0) {
+        stepVal = DEFAULT_BID_STEP;   // 未填 → 默认 1
+      } else if (stepRaw < 1 || stepRaw !== Math.floor(stepRaw)) {
+        setState('幅度不合法', '#fff1f0', '#cf1322');
+        log('加价幅度必须为 ≥1 的整数（如 1、2、5），当前填了 ' + stepRaw + '，停止出价');
+        cfg.running = false;
+        return;
+      } else {
+        stepVal = stepRaw;
+      }
+
+      // 出价 = 当前价 + 加价幅度
+      const cur = getCurrentPrice();
+      if (isNaN(cur)) {
+        setState('读取价格失败', '#fff1f0', '#cf1322');
+        log('无法读取当前价，停止出价');
+        cfg.running = false;
+        return;
+      }
+      let bidPrice = cur + stepVal;
+
+      // 封顶价校验：达到封顶价按封顶价一口价买下
+      const capPrice = getCapPrice();
+      if (!isNaN(capPrice) && bidPrice > capPrice) {
+        log('当前价+加价已超封顶价 ' + capPrice + '，按封顶价出价（一口价）');
+        bidPrice = capPrice;
+      }
+
+      // 心理价校验：出价金额超过心理上限则放弃，不再往上加
+      if (bidPrice > maxPrice) {
+        setState('超出心理价', '#fff1f0', '#cf1322');
+        log('当前价 ' + cur + ' + 加价 ' + stepVal + ' = ' + bidPrice + ' 元 > 心理价 ' + maxPrice + '，放弃出价');
+        cfg.running = false;
+        return;
+      }
+
+      // 冷却保护
+      if (Date.now() - lastBidAt < MIN_BID_GAP_MS) { log('出价冷却中，跳过'); return; }
+
+      // 锁定并异步查找元素出价
+      bidLocked = true;
+      lastBidAt = Date.now();
+      setState('正在出价', '#e6f7ff', '#1890ff');
+      findBidElements(6, 200).then(function (els) {
+        if (!els.input || !els.btn) {
+          setState('出价元素不可用', '#fff1f0', '#cf1322');
+          log('未找到出价输入框/按钮（可能需要登录？）');
+          cfg.running = false;
+          return;
+        }
+        setInputValue(els.input, bidPrice);
+        log('倒计时 ' + remain + 's：出价 ' + bidPrice + ' 元（当前 ' + cur + ' + 加价 ' + stepVal + '）');
+        setTimeout(function () {
+          try {
+            if (!bidButtonDisabled(els.btn)) els.btn.click();
+            log('已点击出价按钮，请留意验证码/弹窗');
+            setState('已出价', '#f6ffed', '#52c41a');
+          } catch (e) {
+            log('点击出价失败：' + e.message);
+            setState('出价失败', '#fff1f0', '#cf1322');
+          }
+        }, 80);
+      });
+    }
+  }
+
+  function start() {
+    cfg.maxPrice = elMax.value;
+    const stepRaw = parseFloat(elStep.value);
+    cfg.bidStep = (!isNaN(stepRaw) && stepRaw >= 1 && stepRaw === Math.floor(stepRaw)) ? stepRaw : DEFAULT_BID_STEP;
+    cfg.aheadSeconds = parseFloat(elAhead.value) || DEFAULT_AHEAD_SECONDS;
+    saveCfg();
+    cfg.running = true;
+    bidLocked = false;
+    armConfirmClicker();
+    setState('启动中', '#e6f7ff', '#1890ff');
+    log('已启动：心理价上限 ' + cfg.maxPrice + ' 元，加价幅度 ' + cfg.bidStep + ' 元，提前 ' + cfg.aheadSeconds + 's 出价');
+    if (!timer) timer = setInterval(tick, POLL_MS);
+    tick();
+  }
+
+  function stop() {
+    cfg.running = false;
+    setState('已停止', '#f0f0f0', '#999');
+    log('已停止');
+  }
+
+  elStart.addEventListener('click', start);
+  elStop.addEventListener('click', stop);
+
+  // 页面加载后先刷新一次信息
+  setTimeout(tick, 800);
+})();
