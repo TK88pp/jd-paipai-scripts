@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         京东拍拍夺宝岛抢拍助手（心理价最后一刻出价）
 // @namespace    https://1paipai.jd.com/
-// @version      1.1.4
+// @version      1.1.5
 // @description  适配新版 1paipai.jd.com 拍卖详情页：设置心理最高价与加价幅度，倒计时最后 N 秒按「当前价+加价幅度」出价（保守竞争模式，不直接出心理价）。仅剩最后几秒出一次价，不刷接口。
-// @changelog    1.1.4 修复出价输入框找不到的 bug（页面结构为 div.auction-choose-amount，原脚本误用 li 标签选择器）；出价按钮与输入框增加多重兜底选择器
+// @changelog    1.1.5 修复出价后页面卡死：移除自动关闭弹窗逻辑（元凶——出价失败时页面弹「提示」框，旧版会瞬间关掉并留下全屏遮罩锁死页面）；新增出价结果校验+失败自动重试（最多3次）；自动清理残留遮罩；监听出价接口返回并把成功/失败原因写入日志
 // @author       WorkBuddy
 // @match        https://1paipai.jd.com/auction-detail/*
 // @grant        none
@@ -27,13 +27,15 @@
   const DEFAULT_BID_STEP = 1;        // 默认加价幅度（元）
   const POLL_MS = 500;               // 轮询间隔
   const MIN_BID_GAP_MS = 1000;       // 出价后冷却（防重复提交）
+  const BID_VERIFY_MS = 6000;        // 出价后等待生效的时间
+  const MAX_BID_ATTEMPTS = 3;        // 出价未生效时最多尝试次数
 
   // ---------- 状态 ----------
   let cfg = { maxPrice: '', bidStep: DEFAULT_BID_STEP, aheadSeconds: DEFAULT_AHEAD_SECONDS, running: false };
   let bidLocked = false;             // 本次监控周期内是否已出价
+  let bidOutcome = null;             // 出价结果：null=进行中 / 'ok' / 'retry' / 'fail'
   let lastBidAt = 0;
   let timer = null;
-  let confirmObs = null;
 
   try { const s = localStorage.getItem(LS_KEY); if (s) cfg = Object.assign(cfg, JSON.parse(s)); } catch (e) {}
 
@@ -135,20 +137,66 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  // 自动点掉确认弹窗（Element UI message-box）
-  function armConfirmClicker() {
-    if (confirmObs) return;
-    confirmObs = new MutationObserver(function () {
-      const okBtn = $('.el-message-box .el-button--primary, .el-message-box__btns .el-button--primary');
-      if (okBtn && okBtn.offsetParent !== null) {
-        try { okBtn.click(); log('已自动点击确认弹窗'); } catch (e) {}
+  // 监听出价接口（paipai.auction.offerPrice）的返回，把成功/失败原因写进日志
+  function hookBidApi() {
+    if (window.__pbBidHooked) return;
+    window.__pbBidHooked = true;
+    try {
+      const _open = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (m, u) { this.__pbUrl = String(u || ''); return _open.apply(this, arguments); };
+      const _send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function () {
+        const xhr = this;
+        try {
+          if (xhr.__pbUrl && xhr.__pbUrl.indexOf('offerPrice') >= 0) {
+            xhr.addEventListener('load', function () {
+              try {
+                const r = JSON.parse(xhr.responseText);
+                const msg = r.msg || r.message || '';
+                const okCode = ['0', '200', '0000'].indexOf(String(r.code)) >= 0;
+                if (r.success === false || (r.code !== undefined && !okCode)) {
+                  log('❌ 出价接口拒绝：' + (msg || ('code=' + r.code)) + '（详见页面弹窗）');
+                } else {
+                  log('✅ 出价接口已受理' + (msg ? '：' + msg : ''));
+                }
+              } catch (e) { log('出价接口已返回（内容无法解析）'); }
+            });
+          }
+        } catch (e) {}
+        return _send.apply(this, arguments);
+      };
+    } catch (e) {}
+  }
+
+  // 弹窗监视（代替旧的自动关弹窗逻辑）：
+  // 1. 把可见弹窗的文字播报到日志（便于知道出价被拒的原因）
+  // 2. 自动清理"残留遮罩"：遮罩存在但没有任何可见弹窗时，页面会被透明遮罩锁死（点什么都没反应），
+  //    连续 2 个周期确认后移除遮罩，恢复页面可点击
+  let lastDlgKey = '';
+  let maskStuckTicks = 0;
+  function visibleDialogs() {
+    return [].slice.call(document.querySelectorAll('.el-dialog__wrapper, .el-message-box__wrapper'))
+      .filter(function (w) { return w.style.display !== 'none' && w.offsetWidth > 0; });
+  }
+  function watchDialogs() {
+    const dlgs = visibleDialogs();
+    if (dlgs.length) {
+      maskStuckTicks = 0;
+      const t = text(dlgs[0]).replace(/\s+/g, ' ').slice(0, 100);
+      if (t && t !== lastDlgKey) { lastDlgKey = t; log('页面弹窗：' + t); }
+      if (/验证码|滑动|拼图/.test(t)) { setState('需人工验证', '#fff1f0', '#cf1322'); }
+    } else {
+      lastDlgKey = '';
+      const mask = document.querySelector('.v-modal');
+      if (mask && mask.offsetWidth > 0) {
+        maskStuckTicks++;
+        if (maskStuckTicks >= 2) {
+          try { mask.remove(); maskStuckTicks = 0; log('已自动清理残留遮罩（页面卡死已恢复）'); } catch (e) {}
+        }
+      } else {
+        maskStuckTicks = 0;
       }
-      const closeBtn = $('.el-dialog__headerbtn');
-      if (closeBtn && closeBtn.offsetParent !== null) {
-        try { closeBtn.click(); log('已自动关闭弹窗'); } catch (e) {}
-      }
-    });
-    confirmObs.observe(document.body, { childList: true, subtree: true });
+    }
   }
 
   // ---------- UI ----------
@@ -239,6 +287,9 @@
   }
 
   function tick() {
+    // 弹窗监视与残留遮罩清理（无论是否启动都常驻）
+    watchDialogs();
+
     // 刷新信息面板
     const price = getCurrentPrice();
     if (!isNaN(price)) elPrice.textContent = price.toFixed(2);
@@ -272,7 +323,15 @@
     if (state !== 'ing') { setState('未开拍', '#f0f0f0', '#999'); return; }
 
     // 竞拍中
-    if (bidLocked) { setState('已出价，等待结果', '#e6f7ff', '#1890ff'); return; }
+    if (bidLocked) {
+      const m = {
+        ok: ['已出价', '#f6ffed', '#52c41a'],
+        retry: ['自动重试中', '#fff7e6', '#d48806'],
+        fail: ['出价未生效', '#fff1f0', '#cf1322']
+      }[bidOutcome] || ['已出价，等待结果', '#e6f7ff', '#1890ff'];
+      setState(m[0], m[1], m[2]);
+      return;
+    }
     if (remain < 0) return;
 
     setState('监控中', '#e6f7ff', '#1890ff');
@@ -331,41 +390,84 @@
       // 冷却保护
       if (Date.now() - lastBidAt < MIN_BID_GAP_MS) { log('出价冷却中，跳过'); return; }
 
-      // 锁定并异步查找元素出价
+      // 锁定并出价（带结果校验与自动重试）
       bidLocked = true;
+      bidOutcome = null;
       lastBidAt = Date.now();
       setState('正在出价', '#e6f7ff', '#1890ff');
-      findBidElements(8, 150).then(function (els) {
-        if (!els.btn) {
-          setState('出价按钮不可用', '#fff1f0', '#cf1322');
-          log('未找到出价按钮（页面可能已结束/未登录/改版），本次未出价');
-          cfg.running = false;
+      attemptBid(bidPrice, cur, getBidCount(), 1);
+    }
+  }
+
+  // 出价执行：填金额 → 点击 → 校验结果，未生效自动重试
+  function attemptBid(bidPrice, prePrice, preCount, attempt) {
+    if (!cfg.running) return;
+    findBidElements(8, 150).then(function (els) {
+      if (!els.btn) {
+        setState('出价按钮不可用', '#fff1f0', '#cf1322');
+        log('未找到出价按钮（页面可能已结束/未登录/改版），本次未出价');
+        cfg.running = false;
+        return;
+      }
+      if (els.input) {
+        setInputValue(els.input, bidPrice);
+        log('第 ' + attempt + ' 次出价 ' + bidPrice + ' 元（当前 ' + prePrice + ' + 加价）');
+      } else {
+        log('第 ' + attempt + ' 次出价（未找到输入框，按页面默认金额）');
+      }
+      setTimeout(function () {
+        if (!cfg.running) return;
+        if (bidButtonDisabled(els.btn)) {
+          log('出价按钮不可点（' + text(els.btn) + '），本次未出价');
+          setState('按钮不可点', '#fff1f0', '#cf1322');
           return;
         }
-        if (els.input) {
-          setInputValue(els.input, bidPrice);
-          log('倒计时 ' + remain + 's：出价 ' + bidPrice + ' 元（当前 ' + cur + ' + 加价 ' + stepVal + '）');
-        } else {
-          log('未找到出价输入框，按页面默认金额出价（通常=当前价+最小加价）');
+        try {
+          els.btn.click();
+          log('已点击出价按钮，等待结果…');
+          setState('已提交，等待结果', '#e6f7ff', '#1890ff');
+        } catch (e) {
+          log('点击出价失败：' + e.message);
+          setState('出价失败', '#fff1f0', '#cf1322');
+          return;
         }
-        setTimeout(function () {
-          try {
-            if (bidButtonDisabled(els.btn)) {
-              log('出价按钮不可点（' + text(els.btn) + '），本次未出价');
-              setState('按钮不可点', '#fff1f0', '#cf1322');
-              cfg.running = false;
-              return;
-            }
-            els.btn.click();
-            log('已点击出价按钮，请留意验证码/弹窗');
-            setState('已出价', '#f6ffed', '#52c41a');
-          } catch (e) {
-            log('点击出价失败：' + e.message);
-            setState('出价失败', '#fff1f0', '#cf1322');
-          }
-        }, 80);
-      });
-    }
+        verifyBid(bidPrice, prePrice, preCount, attempt);
+      }, 80);
+    });
+  }
+
+  // 校验出价是否真的生效：看出价次数 / 当前价有没有变化
+  function verifyBid(bidPrice, prePrice, preCount, attempt) {
+    const t0 = Date.now();
+    (function check() {
+      const cnt = getBidCount();
+      const price = getCurrentPrice();
+      const state = getAuctionState();
+      if (state === 'ended') {
+        log('拍卖已结束，停止校验');
+        setState('已结束', '#f0f0f0', '#999');
+        return;
+      }
+      if (cnt > preCount || (!isNaN(price) && price >= bidPrice)) {
+        log('✅ 出价已生效：当前价 ' + (isNaN(price) ? '?' : price.toFixed(2)) + '，共 ' + cnt + ' 次出价');
+        bidOutcome = 'ok';
+        setState('已出价', '#f6ffed', '#52c41a');
+        return;
+      }
+      if (Date.now() - t0 < BID_VERIFY_MS) { setTimeout(check, 300); return; }
+      // 规定时间内未生效
+      if (attempt < MAX_BID_ATTEMPTS && cfg.running) {
+        log('⚠ 出价未生效（出价次数仍为 ' + cnt + '），2 秒后自动重试');
+        bidOutcome = 'retry';
+        setState('重试出价', '#fff7e6', '#d48806');
+        lastBidAt = Date.now();
+        setTimeout(function () { attemptBid(bidPrice, price, cnt, attempt + 1); }, 2000);
+      } else {
+        log('❌ 出价未生效且已达最大尝试次数，请手动查看页面弹窗');
+        bidOutcome = 'fail';
+        setState('出价未生效', '#fff1f0', '#cf1322');
+      }
+    })();
   }
 
   function start() {
@@ -376,7 +478,8 @@
     saveCfg();
     cfg.running = true;
     bidLocked = false;
-    armConfirmClicker();
+    bidOutcome = null;
+    hookBidApi();
     setState('启动中', '#e6f7ff', '#1890ff');
     log('已启动：心理价上限 ' + cfg.maxPrice + ' 元，加价幅度 ' + cfg.bidStep + ' 元，提前 ' + cfg.aheadSeconds + 's 出价');
     const preInput = getBidInput();
@@ -395,6 +498,9 @@
   elStart.addEventListener('click', start);
   elStop.addEventListener('click', stop);
 
-  // 页面加载后先刷新一次信息
-  setTimeout(tick, 800);
+  // 页面加载后先刷新一次信息，并常驻轮询（弹窗播报/遮罩清理需要持续运行）
+  setTimeout(function () {
+    tick();
+    if (!timer) timer = setInterval(tick, POLL_MS);
+  }, 800);
 })();
