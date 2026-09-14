@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         京东拍拍夺宝岛抢拍助手（心理价最后一刻出价）
 // @namespace    https://1paipai.jd.com/
-// @version      1.1.3
+// @version      1.1.4
 // @description  适配新版 1paipai.jd.com 拍卖详情页：设置心理最高价与加价幅度，倒计时最后 N 秒按「当前价+加价幅度」出价（保守竞争模式，不直接出心理价）。仅剩最后几秒出一次价，不刷接口。
+// @changelog    1.1.4 修复出价输入框找不到的 bug（页面结构为 div.auction-choose-amount，原脚本误用 li 标签选择器）；出价按钮与输入框增加多重兜底选择器
 // @author       WorkBuddy
 // @match        https://1paipai.jd.com/auction-detail/*
 // @grant        none
@@ -92,8 +93,29 @@
     return p ? parseFloat(p.innerText) : NaN;
   }
 
-  function getBidInput() { return $('li.auction-choose-amount input.el-input__inner'); }
-  function getBidButton() { return $('#choose-btns a, #choose-btns button'); }
+  // 出价金额输入框（页面实际结构：div.auction-choose-amount > div.dd > .el-input-number > .el-input > input）
+  // 注意：容器是 div 不是 li，历史版本误用 li 标签选择器导致永远找不到，这里改用类选择器并加多层兜底
+  function getBidInput() {
+    return $('.auction-choose-amount input.el-input__inner')
+        || $('.p-choose-wrap .el-input-number input.el-input__inner')
+        || $('.el-input-number input.el-input__inner')
+        || $('#choose-btns input');
+  }
+
+  // 出价按钮：优先取「出价」字样的按钮，其次 #choose-btns 内任意可点元素
+  function getBidButton() {
+    const box = $('#choose-btns');
+    if (box) {
+      const all = [].slice.call(box.querySelectorAll('a, button'));
+      const byText = all.filter(function (b) { return /出价|买下|一口价/.test(text(b)); });
+      const usable = (byText.length ? byText : all).filter(function (b) {
+        return !b.disabled && !/disabled/.test(b.className || '');
+      });
+      if (usable.length) return usable[0];
+      if (all.length) return all[0];
+    }
+    return $('#InitCartUrl') || $('a.btn-special6');
+  }
 
   // 判断出价按钮当前是否可点
   function bidButtonDisabled(btn) {
@@ -203,7 +225,10 @@
       (function attempt() {
         const input = getBidInput();
         const btn = getBidButton();
-        if ((input && btn && !bidButtonDisabled(btn)) || tried >= maxTry) {
+        const btnOk = !!(btn && !bidButtonDisabled(btn));
+        // 按钮可点，且（输入框已就绪 或 重试几次后确认本场次确实没有输入框）→ 立即返回，避免白白耗掉最后几秒
+        const inputSettled = !!input || tried >= 3;
+        if ((btnOk && inputSettled) || tried >= maxTry) {
           resolve({ input: input || null, btn: btn || null });
           return;
         }
@@ -310,18 +335,28 @@
       bidLocked = true;
       lastBidAt = Date.now();
       setState('正在出价', '#e6f7ff', '#1890ff');
-      findBidElements(6, 200).then(function (els) {
-        if (!els.input || !els.btn) {
-          setState('出价元素不可用', '#fff1f0', '#cf1322');
-          log('未找到出价输入框/按钮（可能需要登录？）');
+      findBidElements(8, 150).then(function (els) {
+        if (!els.btn) {
+          setState('出价按钮不可用', '#fff1f0', '#cf1322');
+          log('未找到出价按钮（页面可能已结束/未登录/改版），本次未出价');
           cfg.running = false;
           return;
         }
-        setInputValue(els.input, bidPrice);
-        log('倒计时 ' + remain + 's：出价 ' + bidPrice + ' 元（当前 ' + cur + ' + 加价 ' + stepVal + '）');
+        if (els.input) {
+          setInputValue(els.input, bidPrice);
+          log('倒计时 ' + remain + 's：出价 ' + bidPrice + ' 元（当前 ' + cur + ' + 加价 ' + stepVal + '）');
+        } else {
+          log('未找到出价输入框，按页面默认金额出价（通常=当前价+最小加价）');
+        }
         setTimeout(function () {
           try {
-            if (!bidButtonDisabled(els.btn)) els.btn.click();
+            if (bidButtonDisabled(els.btn)) {
+              log('出价按钮不可点（' + text(els.btn) + '），本次未出价');
+              setState('按钮不可点', '#fff1f0', '#cf1322');
+              cfg.running = false;
+              return;
+            }
+            els.btn.click();
             log('已点击出价按钮，请留意验证码/弹窗');
             setState('已出价', '#f6ffed', '#52c41a');
           } catch (e) {
@@ -344,6 +379,9 @@
     armConfirmClicker();
     setState('启动中', '#e6f7ff', '#1890ff');
     log('已启动：心理价上限 ' + cfg.maxPrice + ' 元，加价幅度 ' + cfg.bidStep + ' 元，提前 ' + cfg.aheadSeconds + 's 出价');
+    const preInput = getBidInput();
+    const preBtn = getBidButton();
+    log('元素自检：输入框 ' + (preInput ? '✓' : '✗') + ' ｜ 出价按钮 ' + (preBtn ? '✓「' + text(preBtn) + '」' : '✗ 未找到'));
     if (!timer) timer = setInterval(tick, POLL_MS);
     tick();
   }
