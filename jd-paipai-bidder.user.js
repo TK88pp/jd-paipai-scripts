@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         京东拍拍夺宝岛抢拍助手（心理价最后一刻出价）
 // @namespace    https://1paipai.jd.com/
-// @version      1.1.5
+// @version      1.1.6
 // @description  适配新版 1paipai.jd.com 拍卖详情页：设置心理最高价与加价幅度，倒计时最后 N 秒按「当前价+加价幅度」出价（保守竞争模式，不直接出心理价）。仅剩最后几秒出一次价，不刷接口。
-// @changelog    1.1.5 修复出价后页面卡死：移除自动关闭弹窗逻辑（元凶——出价失败时页面弹「提示」框，旧版会瞬间关掉并留下全屏遮罩锁死页面）；新增出价结果校验+失败自动重试（最多3次）；自动清理残留遮罩；监听出价接口返回并把成功/失败原因写入日志
+// @changelog    1.1.6 「开始抢拍」与「停止」合并为一个切换按钮：未启动时显示红色「▶ 开始抢拍」，运行中变为深灰「■ 停止抢拍」，点击即切换
 // @author       WorkBuddy
 // @match        https://1paipai.jd.com/auction-detail/*
 // @grant        none
@@ -233,10 +233,7 @@
       状态：<b id="pb-status">--</b>
     </div>
     <div id="pb-log" style="min-height:34px;max-height:72px;overflow:auto;background:#fafafa;border-radius:6px;padding:4px 8px;margin-bottom:8px;color:#555;font-size:12px;"></div>
-    <div style="display:flex;gap:8px;">
-      <button id="pb-start" style="flex:1;padding:6px 0;border:0;border-radius:6px;background:#e1251b;color:#fff;cursor:pointer;">▶ 开始抢拍</button>
-      <button id="pb-stop" style="flex:1;padding:6px 0;border:1px solid #d9d9d9;border-radius:6px;background:#fff;color:#666;cursor:pointer;">■ 停止</button>
-    </div>
+    <button id="pb-toggle" style="width:100%;padding:7px 0;border:0;border-radius:6px;background:#e1251b;color:#fff;cursor:pointer;font-size:14px;">▶ 开始抢拍</button>
   `;
   document.body.appendChild(panel);
 
@@ -249,8 +246,23 @@
   const elMax = panel.querySelector('#pb-max');
   const elStep = panel.querySelector('#pb-step');
   const elAhead = panel.querySelector('#pb-ahead');
-  const elStart = panel.querySelector('#pb-start');
-  const elStop = panel.querySelector('#pb-stop');
+  const elStart = panel.querySelector('#pb-toggle');
+  const elStop = elStart;   // 单按钮：开始/停止共用一个元素
+
+  // 同步切换按钮外观：未启动=红「▶ 开始抢拍」，运行中=深灰「■ 停止抢拍」
+  function updateToggle() {
+    if (cfg.running) {
+      elStart.textContent = '■ 停止抢拍';
+      elStart.style.background = '#4a4a4a';
+      elStart.style.border = '0';
+      elStart.style.color = '#fff';
+    } else {
+      elStart.textContent = '▶ 开始抢拍';
+      elStart.style.background = '#e1251b';
+      elStart.style.border = '0';
+      elStart.style.color = '#fff';
+    }
+  }
 
   function log(msg) {
     const line = document.createElement('div');
@@ -263,6 +275,7 @@
     elState.textContent = txt;
     elState.style.background = bg || '#f0f0f0';
     elState.style.color = color || '#999';
+    updateToggle();   // 每次状态变化同步按钮外观
   }
 
   // ---------- 核心逻辑 ----------
@@ -308,7 +321,7 @@
     };
     elStatus.textContent = statusMap[state] || state;
 
-    if (!cfg.running) return;
+    if (!cfg.running) { updateToggle(); return; }
 
     if (state === 'beginning') {
       setState('等待开拍', '#fff7e6', '#d48806');
@@ -495,8 +508,8 @@
     log('已停止');
   }
 
-  elStart.addEventListener('click', start);
-  elStop.addEventListener('click', stop);
+  elStart.addEventListener('click', function () { cfg.running ? stop() : start(); });
+  updateToggle();   // 初始渲染
 
   // 页面加载后先刷新一次信息，并常驻轮询（弹窗播报/遮罩清理需要持续运行）
   setTimeout(function () {
